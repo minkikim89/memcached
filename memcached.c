@@ -194,6 +194,83 @@ rel_time_t realtime(const time_t exptime) {
     }
 }
 
+/*
+ * We keep the current time of day in a global variable that's updated by a
+ * timer event. This saves us a bunch of time() system calls (we really only
+ * need to get the time once a second, whereas there can be tens of thousands
+ * of requests a second) and allows us to use server-start-relative timestamps
+ * rather than absolute UNIX timestamps, a space savings on systems where
+ * sizeof(time_t) > sizeof(unsigned int).
+ */
+volatile rel_time_t current_time;
+static struct event clockevent;
+#ifdef MEMCACHED_DEBUG
+volatile bool is_paused;
+volatile int64_t delta;
+#endif
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+static bool monotonic = false;
+static int64_t monotonic_start;
+#endif
+
+/* libevent uses a monotonic clock when available for event scheduling. Aside
+ * from jitter, simply ticking our internal timer here is accurate enough.
+ * Note that users who are setting explicit dates for expiration times *must*
+ * ensure their clocks are correct before starting memcached. */
+static void clock_handler(const evutil_socket_t fd, const short which, void *arg) {
+    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
+    static bool initialized = false;
+
+    if (initialized) {
+        /* only delete the event if it's actually there. */
+        evtimer_del(&clockevent);
+    } else {
+        initialized = true;
+    }
+
+    // While we're here, check for hash table expansion.
+    // This function should be quick to avoid delaying the timer.
+    assoc_start_expand(stats_state.curr_items);
+    // also, if HUP'ed we need to do some maintenance.
+    // for now that's just the authfile reload.
+    if (settings.sig_hup) {
+        settings.sig_hup = false;
+
+        authfile_load(settings.auth_file);
+    }
+
+    evtimer_set(&clockevent, clock_handler, 0);
+    event_base_set(main_base, &clockevent);
+    evtimer_add(&clockevent, &t);
+
+#ifdef MEMCACHED_DEBUG
+    if (is_paused) return;
+#endif
+
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    if (monotonic) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+            return;
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start + delta);
+#else
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+#endif
+        return;
+    }
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (tv.tv_sec - process_started + delta);
+#else
+        current_time = (rel_time_t) (tv.tv_sec - process_started);
+#endif
+    }
+}
+
 static void stats_init(void) {
     memset(&stats, 0, sizeof(struct stats));
     memset(&stats_state, 0, sizeof(struct stats_state));
@@ -3694,67 +3771,6 @@ static int server_socket_unix(const char *path, int access_mask) {
 #else
 #define server_socket_unix(path, access_mask)   -1
 #endif /* #ifndef DISABLE_UNIX_SOCKET */
-
-/*
- * We keep the current time of day in a global variable that's updated by a
- * timer event. This saves us a bunch of time() system calls (we really only
- * need to get the time once a second, whereas there can be tens of thousands
- * of requests a second) and allows us to use server-start-relative timestamps
- * rather than absolute UNIX timestamps, a space savings on systems where
- * sizeof(time_t) > sizeof(unsigned int).
- */
-volatile rel_time_t current_time;
-static struct event clockevent;
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-static bool monotonic = false;
-static int64_t monotonic_start;
-#endif
-
-/* libevent uses a monotonic clock when available for event scheduling. Aside
- * from jitter, simply ticking our internal timer here is accurate enough.
- * Note that users who are setting explicit dates for expiration times *must*
- * ensure their clocks are correct before starting memcached. */
-static void clock_handler(const evutil_socket_t fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
-    static bool initialized = false;
-
-    if (initialized) {
-        /* only delete the event if it's actually there. */
-        evtimer_del(&clockevent);
-    } else {
-        initialized = true;
-    }
-
-    // While we're here, check for hash table expansion.
-    // This function should be quick to avoid delaying the timer.
-    assoc_start_expand(stats_state.curr_items);
-    // also, if HUP'ed we need to do some maintenance.
-    // for now that's just the authfile reload.
-    if (settings.sig_hup) {
-        settings.sig_hup = false;
-
-        authfile_load(settings.auth_file);
-    }
-
-    evtimer_set(&clockevent, clock_handler, 0);
-    event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
-
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    if (monotonic) {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
-            return;
-        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
-        return;
-    }
-#endif
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        current_time = (rel_time_t) (tv.tv_sec - process_started);
-    }
-}
 
 static const char* flag_enabled_disabled(bool flag) {
     return (flag ? "enabled" : "disabled");
